@@ -1,16 +1,334 @@
-import * as anchor from "@coral-xyz/anchor";
-import { Program } from "@coral-xyz/anchor";
-import { AnchorVault } from "../target/types/anchor_vault";
+import * as anchor from '@coral-xyz/anchor';
+import { Program } from '@coral-xyz/anchor';
+import { AnchorVault } from '../target/types/anchor_vault';
+import { expect } from 'chai';
+import { PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';
 
-describe("anchor-vault", () => {
+describe('anchor-vault', () => {
   // Configure the client to use the local cluster.
-  anchor.setProvider(anchor.AnchorProvider.env());
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
 
-  const program = anchor.workspace.anchorVault as Program<AnchorVault>;
+  const program = anchor.workspace.AnchorVault as Program<AnchorVault>;
+  const connection = provider.connection;
+  const wallet = provider.wallet as anchor.Wallet;
 
-  it("Is initialized!", async () => {
-    // Add your test here.
-    const tx = await program.methods.initialize().rpc();
-    console.log("Your transaction signature", tx);
+  // Derive PDAs
+  const [vaultStatePda] = PublicKey.findProgramAddressSync(
+    [Buffer.from('state'), wallet.publicKey.toBuffer()],
+    program.programId,
+  );
+
+  const [vaultPda] = PublicKey.findProgramAddressSync(
+    [Buffer.from('vault'), wallet.publicKey.toBuffer()],
+    program.programId,
+  );
+
+  describe('Initialize', () => {
+    it('Successfully initializes the vault state', async () => {
+      const tx = await program.methods
+        .initialize()
+        .accounts({
+          signer: wallet.publicKey,
+        })
+        .rpc();
+
+      console.log('Initialize transaction signature:', tx);
+
+      // Verify the vault state account was created
+      const vaultStateAccount = await program.account.vaultState.fetch(
+        vaultStatePda,
+      );
+      expect(vaultStateAccount.bump).to.be.a('number');
+    });
+
+    it('Fails to initialize twice', async () => {
+      try {
+        await program.methods
+          .initialize()
+          .accounts({
+            signer: wallet.publicKey,
+          })
+          .rpc();
+        expect.fail('Should have thrown an error');
+      } catch (error) {
+        expect(error.message).to.include('already in use');
+      }
+    });
+  });
+
+  describe('Deposit', () => {
+    it('Successfully deposits funds into the vault', async () => {
+      const depositAmount = 1 * LAMPORTS_PER_SOL;
+
+      // Get initial balances
+      const initialSignerBalance = await connection.getBalance(
+        wallet.publicKey,
+      );
+      const initialVaultBalance = await connection.getBalance(vaultPda);
+
+      const tx = await program.methods
+        .deposit(new anchor.BN(depositAmount))
+        .accounts({
+          signer: wallet.publicKey,
+        })
+        .rpc();
+
+      console.log('Deposit transaction signature:', tx);
+
+      // Verify balances changed correctly
+      const finalSignerBalance = await connection.getBalance(wallet.publicKey);
+      const finalVaultBalance = await connection.getBalance(vaultPda);
+
+      expect(finalVaultBalance).to.equal(initialVaultBalance + depositAmount);
+      expect(finalSignerBalance).to.be.lessThan(
+        initialSignerBalance - depositAmount,
+      );
+    });
+
+    it('Fails to deposit when vault already has funds', async () => {
+      const depositAmount = 0.5 * LAMPORTS_PER_SOL;
+
+      try {
+        await program.methods
+          .deposit(new anchor.BN(depositAmount))
+          .accounts({
+            signer: wallet.publicKey,
+          })
+          .rpc();
+        expect.fail('Should have thrown an error');
+      } catch (error) {
+        expect(error.message).to.include('VaultAlreadyExists');
+      }
+    });
+
+    it('Fails to deposit with insufficient amount', async () => {
+      // First withdraw to clear the vault for this test
+      await program.methods
+        .withdraw()
+        .accounts({
+          signer: wallet.publicKey,
+        })
+        .rpc();
+
+      const tinyAmount = 100; // Very small amount below rent-exempt minimum
+
+      try {
+        await program.methods
+          .deposit(new anchor.BN(tinyAmount))
+          .accounts({
+            signer: wallet.publicKey,
+          })
+          .rpc();
+        expect.fail('Should have thrown an error');
+      } catch (error) {
+        expect(error.message).to.include('InvalidAmount');
+      }
+    });
+  });
+
+  describe('Withdraw', () => {
+    before(async () => {
+      // Ensure there are funds in the vault
+      const vaultBalance = await connection.getBalance(vaultPda);
+      if (vaultBalance === 0) {
+        await program.methods
+          .deposit(new anchor.BN(1 * LAMPORTS_PER_SOL))
+          .accounts({
+            signer: wallet.publicKey,
+          })
+          .rpc();
+      }
+    });
+
+    it('Successfully withdraws all funds from the vault', async () => {
+      // Get initial balances
+      const initialSignerBalance = await connection.getBalance(
+        wallet.publicKey,
+      );
+      const initialVaultBalance = await connection.getBalance(vaultPda);
+
+      expect(initialVaultBalance).to.be.greaterThan(0);
+
+      const tx = await program.methods
+        .withdraw()
+        .accounts({
+          signer: wallet.publicKey,
+        })
+        .rpc();
+
+      console.log('Withdraw transaction signature:', tx);
+
+      // Verify balances changed correctly
+      const finalSignerBalance = await connection.getBalance(wallet.publicKey);
+      const finalVaultBalance = await connection.getBalance(vaultPda);
+
+      expect(finalVaultBalance).to.equal(0);
+      expect(finalSignerBalance).to.be.greaterThan(initialSignerBalance);
+    });
+
+    it('Fails to withdraw from empty vault', async () => {
+      try {
+        await program.methods
+          .withdraw()
+          .accounts({
+            signer: wallet.publicKey,
+          })
+          .rpc();
+        expect.fail('Should have thrown an error');
+      } catch (error) {
+        expect(error.message).to.include('InvalidAmount');
+      }
+    });
+  });
+
+  describe('Close', () => {
+    it('Fails to close vault when it still has funds', async () => {
+      // First deposit to ensure vault has funds
+      await program.methods
+        .deposit(new anchor.BN(1 * LAMPORTS_PER_SOL))
+        .accounts({
+          signer: wallet.publicKey,
+        })
+        .rpc();
+
+      try {
+        await program.methods
+          .close()
+          .accounts({
+            signer: wallet.publicKey,
+          })
+          .rpc();
+        expect.fail('Should have thrown an error');
+      } catch (error) {
+        expect(error.message).to.include('VaultNotEmpty');
+      }
+    });
+
+    it('Successfully closes the vault when empty', async () => {
+      // First withdraw all funds
+      await program.methods
+        .withdraw()
+        .accounts({
+          signer: wallet.publicKey,
+        })
+        .rpc();
+
+      // Get initial signer balance
+      const initialSignerBalance = await connection.getBalance(
+        wallet.publicKey,
+      );
+
+      const tx = await program.methods
+        .close()
+        .accounts({
+          signer: wallet.publicKey,
+        })
+        .rpc();
+
+      console.log('Close transaction signature:', tx);
+
+      // Verify the vault state account was closed
+      try {
+        await program.account.vaultState.fetch(vaultStatePda);
+        expect.fail('Account should be closed');
+      } catch (error) {
+        expect(error.message).to.include('Account does not exist');
+      }
+
+      // Verify signer received rent back
+      const finalSignerBalance = await connection.getBalance(wallet.publicKey);
+      expect(finalSignerBalance).to.be.greaterThan(initialSignerBalance);
+    });
+  });
+
+  describe('Full Lifecycle', () => {
+    let newKeypair: anchor.web3.Keypair;
+    let newVaultStatePda: PublicKey;
+    let newVaultPda: PublicKey;
+
+    before(async () => {
+      // Create a new keypair for this test
+      newKeypair = anchor.web3.Keypair.generate();
+
+      // Airdrop some SOL to the new keypair
+      const signature = await connection.requestAirdrop(
+        newKeypair.publicKey,
+        2 * LAMPORTS_PER_SOL,
+      );
+      await connection.confirmTransaction(signature);
+
+      // Derive PDAs for new keypair
+      [newVaultStatePda] = PublicKey.findProgramAddressSync(
+        [Buffer.from('state'), newKeypair.publicKey.toBuffer()],
+        program.programId,
+      );
+
+      [newVaultPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from('vault'), newKeypair.publicKey.toBuffer()],
+        program.programId,
+      );
+    });
+
+    it('Completes full lifecycle: initialize -> deposit -> withdraw -> close', async () => {
+      // 1. Initialize
+      await program.methods
+        .initialize()
+        .accounts({
+          signer: newKeypair.publicKey,
+        })
+        .signers([newKeypair])
+        .rpc();
+
+      console.log('✓ Initialized vault');
+
+      // 2. Deposit
+      const depositAmount = 1 * LAMPORTS_PER_SOL;
+      await program.methods
+        .deposit(new anchor.BN(depositAmount))
+        .accounts({
+          signer: newKeypair.publicKey,
+        })
+        .signers([newKeypair])
+        .rpc();
+
+      const vaultBalance = await connection.getBalance(newVaultPda);
+      expect(vaultBalance).to.equal(depositAmount);
+      console.log('✓ Deposited funds');
+
+      // 3. Withdraw
+      await program.methods
+        .withdraw()
+        .accounts({
+          signer: newKeypair.publicKey,
+        })
+        .signers([newKeypair])
+        .rpc();
+
+      const vaultBalanceAfterWithdraw = await connection.getBalance(
+        newVaultPda,
+      );
+      expect(vaultBalanceAfterWithdraw).to.equal(0);
+      console.log('✓ Withdrew funds');
+
+      // 4. Close
+      await program.methods
+        .close()
+        .accounts({
+          signer: newKeypair.publicKey,
+        })
+        .signers([newKeypair])
+        .rpc();
+
+      console.log('✓ Closed vault');
+
+      // Verify closure
+      try {
+        await program.account.vaultState.fetch(newVaultStatePda);
+        expect.fail('Account should be closed');
+      } catch (error) {
+        expect(error.message).to.include('Account does not exist');
+      }
+    });
   });
 });
