@@ -104,12 +104,15 @@ describe('anchor-vault', () => {
 
     it('Fails to deposit with insufficient amount', async () => {
       // First withdraw to clear the vault for this test
-      await program.methods
-        .withdraw()
-        .accounts({
-          signer: wallet.publicKey,
-        })
-        .rpc();
+      const vaultBalance = await connection.getBalance(vaultPda);
+      if (vaultBalance > 0) {
+        await program.methods
+          .withdraw(new anchor.BN(vaultBalance))
+          .accounts({
+            signer: wallet.publicKey,
+          })
+          .rpc();
+      }
 
       const tinyAmount = 100; // Very small amount below rent-exempt minimum
 
@@ -151,7 +154,7 @@ describe('anchor-vault', () => {
       expect(initialVaultBalance).to.be.greaterThan(0);
 
       const tx = await program.methods
-        .withdraw()
+        .withdraw(new anchor.BN(initialVaultBalance))
         .accounts({
           signer: wallet.publicKey,
         })
@@ -167,77 +170,146 @@ describe('anchor-vault', () => {
       expect(finalSignerBalance).to.be.greaterThan(initialSignerBalance);
     });
 
+    it('Successfully withdraws partial funds (0.5 SOL)', async () => {
+       // Deposit 1 SOL first to ensure enough funds
+       await program.methods
+         .deposit(new anchor.BN(1 * LAMPORTS_PER_SOL))
+         .accounts({
+           signer: wallet.publicKey,
+         })
+         .rpc();
+
+       const initialVaultBalance = await connection.getBalance(vaultPda);
+       const withdrawAmount = 0.5 * LAMPORTS_PER_SOL;
+
+       await program.methods
+         .withdraw(new anchor.BN(withdrawAmount))
+         .accounts({
+           signer: wallet.publicKey,
+         })
+         .rpc();
+
+       const finalVaultBalance = await connection.getBalance(vaultPda);
+       expect(finalVaultBalance).to.equal(initialVaultBalance - withdrawAmount);
+    });
+
     it('Fails to withdraw from empty vault', async () => {
       try {
         await program.methods
-          .withdraw()
+          .withdraw(new anchor.BN(1 * LAMPORTS_PER_SOL))
           .accounts({
             signer: wallet.publicKey,
           })
           .rpc();
         expect.fail('Should have thrown an error');
       } catch (error) {
-        expect(error.message).to.include('InvalidAmount');
+        expect(error.message).to.include('InsufficientAmount');
       }
     });
   });
 
+
   describe('Close', () => {
-    it('Fails to close vault when it still has funds', async () => {
-      // First deposit to ensure vault has funds
+    let testUser: anchor.web3.Keypair;
+    let testVaultStatePda: PublicKey;
+    let testVaultPda: PublicKey;
+
+    beforeEach(async () => {
+      testUser = anchor.web3.Keypair.generate();
+
+      const signature = await connection.requestAirdrop(
+        testUser.publicKey,
+        2 * LAMPORTS_PER_SOL,
+      );
+      await connection.confirmTransaction(signature);
+
+      [testVaultStatePda] = PublicKey.findProgramAddressSync(
+        [Buffer.from('state'), testUser.publicKey.toBuffer()],
+        program.programId,
+      );
+
+      [testVaultPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from('vault'), testUser.publicKey.toBuffer()],
+        program.programId,
+      );
+
       await program.methods
-        .deposit(new anchor.BN(1 * LAMPORTS_PER_SOL))
+        .initialize()
         .accounts({
-          signer: wallet.publicKey,
+          signer: testUser.publicKey,
         })
+        .signers([testUser])
+        .rpc();
+    });
+
+
+    
+    it('Successfully closes the vault even when not empty', async () => {
+      // Re-initialize for this test since previous test closed it
+      // Wait, we generate a fresh user in beforeEach, so we just run logic
+      // Deposit funds
+      const depositAmount = 1 * LAMPORTS_PER_SOL;
+      await program.methods
+        .deposit(new anchor.BN(depositAmount))
+        .accounts({
+           signer: testUser.publicKey,
+        })
+        .signers([testUser])
         .rpc();
 
+      const initialVaultBalance = await connection.getBalance(testVaultPda);
+      expect(initialVaultBalance).to.equal(depositAmount);
+
+      const initialSignerBalance = await connection.getBalance(testUser.publicKey);
+
+      // Close without withdrawing
+      const tx = await program.methods
+        .close()
+        .accounts({
+          signer: testUser.publicKey,
+        })
+        .signers([testUser])
+        .rpc();
+        
+      console.log('Close non-empty vault transaction signature:', tx);
+
+      // Verify the vault state account was closed
       try {
-        await program.methods
-          .close()
-          .accounts({
-            signer: wallet.publicKey,
-          })
-          .rpc();
-        expect.fail('Should have thrown an error');
+        await program.account.vaultState.fetch(testVaultStatePda);
+        expect.fail('Account should be closed');
       } catch (error) {
-        expect(error.message).to.include('VaultNotEmpty');
+        expect(error.message).to.include('Account does not exist');
       }
+
+      // Verify signer received funds back (deposit + rent)
+      const finalSignerBalance = await connection.getBalance(testUser.publicKey);
+      expect(finalSignerBalance).to.be.greaterThan(initialSignerBalance);
     });
 
     it('Successfully closes the vault when empty', async () => {
-      // First withdraw all funds
-      await program.methods
-        .withdraw()
-        .accounts({
-          signer: wallet.publicKey,
-        })
-        .rpc();
-
-      // Get initial signer balance
-      const initialSignerBalance = await connection.getBalance(
-        wallet.publicKey,
-      );
+      // Vault is already empty from initialization
+      const initialSignerBalance = await connection.getBalance(testUser.publicKey);
 
       const tx = await program.methods
         .close()
         .accounts({
-          signer: wallet.publicKey,
+          signer: testUser.publicKey,
         })
+        .signers([testUser])
         .rpc();
 
       console.log('Close transaction signature:', tx);
 
       // Verify the vault state account was closed
       try {
-        await program.account.vaultState.fetch(vaultStatePda);
+        await program.account.vaultState.fetch(testVaultStatePda);
         expect.fail('Account should be closed');
       } catch (error) {
         expect(error.message).to.include('Account does not exist');
       }
 
       // Verify signer received rent back
-      const finalSignerBalance = await connection.getBalance(wallet.publicKey);
+      const finalSignerBalance = await connection.getBalance(testUser.publicKey);
       expect(finalSignerBalance).to.be.greaterThan(initialSignerBalance);
     });
   });
@@ -298,7 +370,7 @@ describe('anchor-vault', () => {
 
       // 3. Withdraw
       await program.methods
-        .withdraw()
+        .withdraw(new anchor.BN(depositAmount))
         .accounts({
           signer: newKeypair.publicKey,
         })

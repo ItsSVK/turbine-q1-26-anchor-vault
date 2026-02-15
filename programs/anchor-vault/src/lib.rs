@@ -35,15 +35,15 @@ pub mod anchor_vault {
         Ok(())
     }
 
-    pub fn withdraw(ctx: Context<VaultAction>) -> Result<()> {
-        // Check if vault has any lamports
-        require_neq!(ctx.accounts.vault.lamports(), 0, VaultError::InvalidAmount);
+    pub fn withdraw(ctx: Context<VaultAction>, amount: u64) -> Result<()> {
+        // Check if vault has that amount lamports
+        require_gte!(ctx.accounts.vault.lamports(), amount, VaultError::InsufficientAmount);
         
         // Create PDA signer seeds
         let signer_key = ctx.accounts.signer.key();
         let signer_seeds = &[b"vault", signer_key.as_ref(), &[ctx.bumps.vault]];
 
-        // Transfer all lamports from vault to signer
+        // Transfer lamports from vault to signer
         transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.system_program.to_account_info(),
@@ -53,15 +53,32 @@ pub mod anchor_vault {
                 },
                 &[&signer_seeds[..]]
             ),
-            ctx.accounts.vault.lamports()
+            amount
         )?;
 
         Ok(())
     }
 
     pub fn close(ctx: Context<Close>) -> Result<()> {
-        // Check if vault is empty before closing
-        require_eq!(ctx.accounts.vault.lamports(), 0, VaultError::VaultNotEmpty);
+        // Create PDA signer seeds
+        let signer_key = ctx.accounts.signer.key();
+        let signer_seeds = &[b"vault", signer_key.as_ref(), &[ctx.bumps.vault]];
+
+        // Only transfer if vault has funds
+        if ctx.accounts.vault.lamports() > 0 {
+            transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.system_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.vault.to_account_info(),
+                        to: ctx.accounts.signer.to_account_info(),
+                    },
+                    &[&signer_seeds[..]]
+                ),
+                ctx.accounts.vault.lamports()
+            )?;
+        }
+
         Ok(())
     }
 }
@@ -131,6 +148,7 @@ pub enum VaultError {
     VaultAlreadyExists,
     #[msg("Invalid amount")]
     InvalidAmount,
-    #[msg("Vault must be empty before closing")]
-    VaultNotEmpty,
+    #[msg("Insufficent Amount")]
+    InsufficientAmount,
+
 }
